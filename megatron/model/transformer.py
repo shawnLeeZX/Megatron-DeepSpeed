@@ -644,7 +644,7 @@ class ParallelAttention(MegatronModule):
                                      head_dim)
                                      
     def split_tensor(self, mixed_x_layer):
-        query_layer = mixed_x_layer[:, :, :, :-2, :].reshape(mixed_x_layer.shape[:-1] + (-1, self.hidden_size_per_attention_head))
+        query_layer = mixed_x_layer[:, :, :, :-2, :].reshape(mixed_x_layer.shape[:-3] + (-1, self.hidden_size_per_attention_head))
         key_layer = mixed_x_layer[:, :, :, -2, :]
         value_layer = mixed_x_layer[:, :, :, -1, :]
 
@@ -1371,6 +1371,12 @@ class ParallelTransformerLayerPipe(ParallelTransformerLayer):
         if torch.is_tensor(inputs) or len(inputs) == 1:
             # No attention mask forwarded, search for args.attn_mask
             hidden_states, attention_mask = inputs, self._args.attn_mask
+            # Attention mask constantly change when we are generating
+            if 'inference_params' in kwargs:
+                prev_context_length = kwargs['inference_params'].sequence_len_offset
+                context_length = prev_context_length + hidden_states.size(0)
+                kwargs['inference_params'].next_sequence_len = context_length
+                attention_mask = attention_mask[..., prev_context_length:context_length, :context_length]
             # HACK: currently MoE model does not support pipeline parallel, so
             # here we just ignore the moe_loss returned by forward()
             return super().forward(hidden_states, attention_mask, **kwargs, rotary_pos_emb=rotary_pos_emb)[0]
@@ -1379,7 +1385,7 @@ class ParallelTransformerLayerPipe(ParallelTransformerLayer):
             hidden_states, attention_mask = inputs[0], inputs[1]
             # HACK: currently MoE model does not support pipeline parallel, so
             # here we just ignore the moe_loss returned by forward()
-            return super().forward(*inputs, **kwargs, rotary_pos_emb=rotary_pos_emb)[0], attention_mask
+            return super().forward(hidden_states, attention_mask, **kwargs, rotary_pos_emb=rotary_pos_emb)[0], attention_mask
         else:
             raise RuntimeError('Received more inputs than understood.')
 
@@ -1999,18 +2005,14 @@ class LMHeadPipe(MegatronModule):
 
     def forward(self, inputs, **kwargs):
         assert torch.is_tensor(inputs) or isinstance(inputs, tuple)
-        if isinstance(inputs, tuple):
-            hidden_states = inputs[0]
-        else:
-            hidden_states = inputs
 
         if not hasattr(self, '_args'):
             self._args = get_args()
 
-        if hasattr(self._args, 'attn_mask'):
-            attention_mask = None
+        if isinstance(inputs, tuple):
+            hidden_states = inputs[0]
         else:
-            attention_mask = inputs[1]
+            hidden_states = inputs
 
         logits, _ = self.lm_head(hidden_states)
 
@@ -2018,4 +2020,5 @@ class LMHeadPipe(MegatronModule):
         if hasattr(self._args, 'attn_mask'):
             return logits
         else:
+            assert False
             return logits, attention_mask

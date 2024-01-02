@@ -336,17 +336,22 @@ class EmbeddingPipe(Embedding):
         if not hasattr(self, '_args'):
             self._args = get_args()
 
-        input_ids = inputs[0]
-        position_ids = inputs[1]
-        if hasattr(self._args, 'attn_mask'):
-            attention_mask = None
-        else:
-            attention_mask = inputs[2]
-
-        if len(inputs) == 4:
-            tokentype_ids = inputs[3]
-        else:
+        if isinstance(inputs, torch.Tensor):
+            input_ids = inputs
+            assert self._args.add_position_embedding is False
+            position_ids = None
             tokentype_ids = None
+        else:
+            input_ids = inputs[0]
+            position_ids = inputs[1]
+            if hasattr(self._args, 'attn_mask'):
+                attention_mask = None
+            else:
+                attention_mask = inputs[2]
+            if len(inputs) == 4:
+                tokentype_ids = inputs[3]
+            else:
+                tokentype_ids = None
         
         embeddings = super().forward(input_ids, position_ids, tokentype_ids=tokentype_ids)
 

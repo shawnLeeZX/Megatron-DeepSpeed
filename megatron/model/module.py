@@ -141,7 +141,7 @@ def fp32_to_float16(val, float16_convertor):
     return conversion_helper(val, half_conversion)
 
 
-def float16_to_fp32(val):
+def float16_to_fp32(val, **kwargs):
     """Convert fp16/bf16 `val` to fp32"""
     def float_conversion(val):
         val_typecheck = val

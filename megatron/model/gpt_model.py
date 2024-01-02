@@ -3,6 +3,7 @@
 """GPT-2 model."""
 
 import torch
+from functools import partial
 
 from megatron import get_args
 from megatron.core import mpu, tensor_parallel, sequence_parallel
@@ -19,10 +20,8 @@ from .language_model import EmbeddingPipe
 from .transformer import ParallelTransformerLayerPipe, LMHeadPipe
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
 
-try:
-    from apex.normalization import MixedFusedRMSNorm
-except ImportError:
-    MixedFusedRMSNorm = None
+from megatron.model import RMSNorm
+
 
 try:         
     from deepspeed.checkpoint import (
@@ -36,6 +35,36 @@ try:
 except ImportError:
     DS_UNIVERSAL_CHECKPOINT_INFO = False  
 
+class InferenceParams:
+    """Inference parameters that are passed to the main model in order
+    to efficienly calculate and store the context during inference."""
+
+    def __init__(self, max_batch_size, max_sequence_len):
+        """Note that offsets are set to zero and we always set the
+        flag to allocate memory. After the first call, make sure to
+        set this flag to False."""
+        self.max_sequence_len = max_sequence_len
+        self.max_batch_size = max_batch_size
+        self.sequence_len_offset = 0
+        self.next_sequence_len = 0
+        self.batch_size_offset = 0
+        self.key_value_memory_dict = {}
+
+    def swap_key_value_dict(self, batch_idx):
+        "swap between batches"
+        if len(self.key_value_memory_dict) == 0:
+            raise ValueError("should not swap when dict in empty")
+        
+        for layer_number in self.key_value_memory_dict.keys():
+            inference_key_memory, inference_value_memory = self.key_value_memory_dict[layer_number]
+            assert len(batch_idx) == inference_key_memory.shape[1] ## make sure batch size is the same
+            new_inference_key_memory = inference_key_memory[:, batch_idx]
+            new_inference_value_memory = inference_value_memory[:, batch_idx]
+            self.key_value_memory_dict[layer_number] = (
+                    new_inference_key_memory, new_inference_value_memory)
+    
+    def update(self):
+        self.sequence_len_offset = self.next_sequence_len
 
 def post_language_model_processing(lm_output, labels, logit_weights,
                                    parallel_output,
@@ -231,7 +260,8 @@ class GPTModelPipe(PipelineModule,MegatronModule):
     def __init__(self,
                  config,
                  num_tokentypes=0,
-                 parallel_output=True):
+                 parallel_output=True,
+                 sample_fn=None):
         args = get_args()
         self.parallel_output = parallel_output
 
@@ -244,7 +274,7 @@ class GPTModelPipe(PipelineModule,MegatronModule):
 
         self.specs = []
 
-        def _to_float16(inputs):
+        def _to_float16(inputs, **kwargs):
             if args.fp16:
                 return fp32_to_float16(inputs, lambda v: v.half())
             elif args.bf16:
@@ -289,7 +319,7 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                           args.hidden_size,
                           eps=args.layernorm_epsilon))
         else:
-            self.specs.append(LayerSpec(MixedFusedRMSNorm, args.hidden_size, args.layernorm_epsilon))
+            self.specs.append(LayerSpec(RMSNorm, args.hidden_size, args.layernorm_epsilon))
 
         def _logits_helper(embedding, lm_output):
             """A wrapper to massage inputs/outputs from pipeline. """
@@ -333,11 +363,18 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                                              num_mp=mpu.get_tensor_model_parallel_world_size(),
                                              num_dp=mpu.get_data_parallel_world_size())
 
+
+        self.inference_params_cls = partial(InferenceParams, max_batch_size=args.micro_batch_size,
+                                        max_sequence_len=args.seq_length)
+
         super().__init__(layers=self.specs,
                          loss_fn=CrossEntropy,
                          topology=topo,
                          activation_checkpoint_interval=interval,
-                         partition_method='type:transformer')
+                         partition_method='type:transformer',
+                         sample_fn=sample_fn,
+                         create_inference_params_fn=self.inference_params_cls,)
+        
 
     @staticmethod
     def _get_vocab_param_patterns():
