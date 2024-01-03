@@ -309,9 +309,8 @@ def main(args_defaults = None):
     data_loader = build_pretraining_data_loader(inputs_ids, args.consumed_train_samples)
     data_iter = iter(data_loader)
     model = setup_model(model_provider_func=model_provider, model_type=ModelType.encoder_or_decoder)
-    if dist.get_rank() == 0:
-        import madbg; madbg.set_trace(ip='0.0.0.0', port=8888 + dist.get_rank())
-    model[0].generate_batch(data_iter)
+    result = model[0].generate_batch(data_iter)
+    print(result)
 
 if __name__ == "__main__":
     main(args_defaults={'tokenizer_type': 'HFTokenizer'})
