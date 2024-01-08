@@ -9,7 +9,7 @@ DS_CONFIG=${BASE_PATH}/deepspeed.json
 LOAD_CHECKPOINT_PATH=/root/models/llama-7b-megads
 TOKENIZER_PATH=/root/models/llama-7b-megads # offical llama tokenizer.model
 
-TP=22
+TP=2
 PP=2
 ZERO_STAGE=0
 
