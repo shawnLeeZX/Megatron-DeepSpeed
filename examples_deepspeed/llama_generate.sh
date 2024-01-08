@@ -9,11 +9,11 @@ DS_CONFIG=${BASE_PATH}/deepspeed.json
 LOAD_CHECKPOINT_PATH=/root/models/llama-7b-megads
 TOKENIZER_PATH=/root/models/llama-7b-megads # offical llama tokenizer.model
 
-TP=1
+TP=22
 PP=2
 ZERO_STAGE=0
 
-GPUS_PER_NODE=1
+GPUS_PER_NODE=2
 MASTER_ADDR=localhost
 MASTER_PORT=6000
 NNODES=2
@@ -24,9 +24,10 @@ FFN_HIDDEN_SIZE=11008 # e.g. llama-13b: 13824
 NUM_LAYERS=32
 NUM_HEADS=32 # e.g. llama-13b: 40
 SEQ_LENGTH=2048
+MAX_NEW_TOKENS=30
 
-MICRO_BATCH_SIZE=2
-GLOBAL_BATCH_SIZE=2 # e.g. llama: 4M tokens
+MICRO_BATCH_SIZE=1
+GLOBAL_BATCH_SIZE=3 # e.g. llama: 4M tokens
 TRAIN_STEPS=1000 # e.g. llama: 1T tokens / 4M tokens_per_batch = 250000 steps
 LR=3e-4
 MIN_LR=3e-5
@@ -85,10 +86,10 @@ fi
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
 
 # torchrun $DISTRIBUTED_ARGS \
-deepspeed --num_nodes=2 --num_gpus=1 \
+deepspeed --num_nodes=2 --num_gpus=2 \
       --hostfile=/root/paddlejob/workspace/hostfile \
       --master_port "${MASTER_PORT}" \
-      megatron/test.py \
+      megatron/ds_text_generation.py \
       --tensor-model-parallel-size $TP \
       --pipeline-model-parallel-size $PP \
       --num-layers $NUM_LAYERS \
@@ -98,7 +99,7 @@ deepspeed --num_nodes=2 --num_gpus=1 \
       --micro-batch-size $MICRO_BATCH_SIZE \
       --global-batch-size $GLOBAL_BATCH_SIZE \
       --seq-length $SEQ_LENGTH \
-      --out-seq-length $SEQ_LENGTH \
+      --max-new-tokens $MAX_NEW_TOKENS \
       --max-position-embeddings $SEQ_LENGTH \
       --finetune \
       --load $LOAD_CHECKPOINT_PATH \
@@ -126,3 +127,5 @@ deepspeed --num_nodes=2 --num_gpus=1 \
       --tokenizer-model $TOKENIZER_PATH \
       $ds_args
 
+
+      # --out-seq-length $SEQ_LENGTH \

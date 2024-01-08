@@ -1368,9 +1368,12 @@ class ParallelTransformerLayerPipe(ParallelTransformerLayer):
             hidden_states, attention_mask = inputs, self._args.attn_mask
             # Attention mask constantly change when we are generating
             if 'inference_params' in kwargs:
-                prev_context_length = kwargs['inference_params'].sequence_len_offset
+                inference_params = kwargs['inference_params']
+                prev_context_length = inference_params.sequence_len_offset
                 context_length = prev_context_length + hidden_states.size(0)
-                kwargs['inference_params'].next_sequence_len = context_length
+                inference_params.next_sequence_len = context_length
+                if inference_params.attn_mask is not None:
+                    attention_mask = inference_params.attn_mask
                 attention_mask = attention_mask[..., prev_context_length:context_length, :context_length]
             # HACK: currently MoE model does not support pipeline parallel, so
             # here we just ignore the moe_loss returned by forward()

@@ -163,12 +163,14 @@ def get_ltor_masks_and_position_ids(data,
                                     reset_position_ids,
                                     reset_attention_mask,
                                     eod_mask_loss,
+                                    out_seq_length=None,
                                     skip_mask=False):
     """Build masks and position id for left to right model."""
 
     # Extract batch size and sequence length.
     micro_batch_size, seq_length = data.size()
-
+    if out_seq_length is not None:
+        seq_length = out_seq_length
     # Attention mask (lower triangular).
     if reset_attention_mask:
         att_mask_batch = micro_batch_size
@@ -188,7 +190,7 @@ def get_ltor_masks_and_position_ids(data,
     # Position ids.
     position_ids = torch.arange(seq_length, dtype=torch.long,
                                 device=data.device)
-    position_ids = position_ids.unsqueeze(0).expand_as(data)
+    position_ids = position_ids.unsqueeze(0).expand(micro_batch_size, seq_length)
     # We need to clone as the ids will be modifed based on batch index.
     if reset_position_ids:
         position_ids = position_ids.clone()

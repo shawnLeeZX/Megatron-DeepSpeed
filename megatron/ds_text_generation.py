@@ -13,56 +13,75 @@ _TRAIN_START_TIME = time.time()
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
-from megatron import get_args
-from megatron import get_signal_handler
-from megatron import get_timers
-from megatron import get_tokenizer
-from megatron import get_tensorboard_writer
-from megatron import get_current_global_batch_size
+from megatron import (
+    get_args,
+    get_timers,
+    get_tokenizer,
+    print_rank_0, 
+    is_rank_0
+)
 from megatron.utils import get_ltor_masks_and_position_ids
-from megatron import get_num_microbatches
-from megatron import is_last_rank
-from megatron import update_num_microbatches
 from megatron.core import mpu, tensor_parallel
-from megatron import print_rank_0, is_rank_0
-from megatron import print_rank_last
-from megatron.checkpointing import load_checkpoint
-from megatron.checkpointing import save_checkpoint
-from megatron.model import Float16Module
-from megatron.model import GPTModel, GPTModelPipe
+from megatron.model import Float16Module, GPTModel, GPTModelPipe
 from megatron.core.enums import ModelType
-from megatron.optimizer import get_megatron_optimizer
 from megatron.initialize import initialize_megatron
-from megatron.initialize import write_args_to_tensorboard
-from megatron.initialize import set_jit_fusion_options
-from megatron.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.model import DistributedDataParallel as LocalDDP
-from megatron.utils import check_adlr_autoresume_termination
-from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
-from megatron.utils import calc_params_l2_norm
-from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.utils import unwrap_model, update_rotary_pos_emb
+from megatron.arguments import core_transformer_config_from_args
+from megatron.text_generation.sampling import sample
+from megatron.checkpointing import load_checkpoint
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_src_rank,
 )
-from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
-from megatron.utils import report_memory, throughput_calculator, checkpoint_throughput_calculator, update_rotary_pos_emb
-from megatron.model.vision.knn_monitor import compute_feature_bank
-from megatron.arguments import core_transformer_config_from_args
-from megatron.text_generation.sampling import sample
 
 import deepspeed
 from deepspeed.runtime.utils import see_memory_usage
 from deepspeed.accelerator import get_accelerator
-from deepspeed.compression.compress import init_compression, redundancy_clean
 from deepspeed.runtime.data_pipeline.data_routing.helper import convert_to_random_ltd
 from megatron.model.transformer import ParallelTransformerLayer
-
 from deepspeed import comm as dist
 
+class InferenceParams:
+    """Inference parameters that are passed to the main model in order
+    to efficienly calculate and store the context during inference."""
+
+    def __init__(self, max_batch_size, max_sequence_len):
+        """Note that offsets are set to zero and we always set the
+        flag to allocate memory. After the first call, make sure to
+        set this flag to False."""
+        self.max_sequence_len = max_sequence_len
+        self.max_batch_size = max_batch_size
+        self.sequence_len_offset = 0
+        self.next_sequence_len = 0
+        self.batch_size_offset = 0
+        self.attn_mask = None
+        self.first_forward = True
+        self.key_value_memory_dict = {}
+
+    def swap_key_value_dict(self, batch_idx):
+        "swap between batches"
+        if len(self.key_value_memory_dict) == 0:
+            raise ValueError("should not swap when dict in empty")
+        
+        for layer_number in self.key_value_memory_dict.keys():
+            inference_key_memory, inference_value_memory = self.key_value_memory_dict[layer_number]
+            assert len(batch_idx) == inference_key_memory.shape[1] ## make sure batch size is the same
+            new_inference_key_memory = inference_key_memory[:, batch_idx]
+            new_inference_value_memory = inference_value_memory[:, batch_idx]
+            self.key_value_memory_dict[layer_number] = (
+                    new_inference_key_memory, new_inference_value_memory)
+    
+    def update(self):
+        self.sequence_len_offset = self.next_sequence_len
+        self.first_forward = False
+
+    def set_attn_mask(self, attn_mask):
+        """Set the attention mask."""
+        self.attn_mask = attn_mask
 def add_text_generate_args(parser):
     """Text generation arguments."""
     group = parser.add_argument_group(title='text generation')
@@ -75,6 +94,9 @@ def add_text_generate_args(parser):
                        help='Top k sampling.')
     group.add_argument("--out-seq-length", type=int, default=1024,
                        help='Size of the output generated text.')
+    group.add_argument("--max-new-tokens", type=int,
+                       help='Maximum number of new tokens to generate.')
+
     return parser
 
 def tensor_parallel_sample(logits, top_p=0.0, top_k=0, temperature=1.0):
@@ -112,14 +134,23 @@ def model_provider(pre_process=True, post_process=True):
                              mpu=mpu):
         
         if args.deepspeed and not args.no_pipeline_parallel:
+            inference_params_cls = partial(InferenceParams, 
+                                           max_batch_size=args.micro_batch_size,
+                                           max_sequence_len=args.seq_length)
+            
+            sample_fn = partial(tensor_parallel_sample, 
+                                temperature=args.temperature, 
+                                top_k=args.top_k, 
+                                top_p=args.top_p)
+            
             model = GPTModelPipe(
                 config=config,
                 num_tokentypes=0,
                 parallel_output=True,
-                sample_fn=partial(tensor_parallel_sample, temperature=args.temperature, top_k=args.top_k, top_p=args.top_p),
+                sample_fn=sample_fn,
+                inference_params_cls=inference_params_cls,
             )
 
-            deepspeed.comm.comm.barrier()
             # This is a hack to give us a reference to get_batch_pipe from within training.py
             # We need to call model.set_batch_fn after deepspeed.initialize
             model._megatron_batch_fn = get_batch_pipe
@@ -144,15 +175,9 @@ def model_provider(pre_process=True, post_process=True):
             # For prertaining, since sequence length is fixed, cache rotary embedding in args, to avoid communicating around
             if args.use_rotary_position_embeddings:
                 update_rotary_pos_emb(args.seq_length)
-
         else:
-            model = GPTModel(
-                config=config,
-                num_tokentypes=0,
-                parallel_output=True,
-                pre_process=pre_process,
-                post_process=post_process
-            )
+            assert False, "Only DeepSpeed model is supported"
+
     see_memory_usage(f"After Building Model", force=True)
     return model
 
@@ -197,7 +222,8 @@ def get_batch_pipe(data):
         tokenizer.eod,
         args.reset_position_ids,
         args.reset_attention_mask,
-        args.eod_mask_loss)
+        args.eod_mask_loss,
+        out_seq_length=args.seq_length)
     if args.curriculum_learning_legacy and args.curriculum_seqlen < tokens.size()[1]:
         # seqlen-based curriculum learning
         # tokens, position_ids, labels, loss_mask have size [batch size, seqlen]
@@ -301,17 +327,16 @@ def main(args_defaults = None):
     initialize_megatron(extra_args_provider=add_text_generate_args,args_defaults=args_defaults)
     args = get_args()
     tokenizer = get_tokenizer()
-    data = [{"text":"This can be achieved by directly using the LlamaTokenizer class, or passing in a b c"},
+    data = [{"text":"This can be achieved by directly using the LlamaTokenizer class, or passing in "},
             {"text":"Of cause, I'm not a fan of the new movie. It's too bad that"},
-            {"text":"As any dog owner knows, our furry little friends can sometimes be a lot to handle. But there's absolutely nothing that excuses what one owner from Chengdu, China, did to their six-week-old pup.\nIt all started when the adorable puppy, who is now known as Tuffy, accidentally mistook his former owner's phone for a chew toy—as a young pup often does. But instead of being understanding, the angry owner doused Tuffy with boiling hot water and threw him off a"},
+            {"text":"As any dog owner knows, our furry little friends can sometimes be a lot to handle. But there's absolutely nothing that excuses what one owner from Chengdu, China, did to their six-week-old pup.\nIt all started when the adorable puppy, who is now known as Tuffy, accidentally mistook his former owner's phone for a chew toy—as a young pup often does. But instead of being understanding, the angry owner doused Tuffy with boiling hot water and threw him off a"}
             ]
     inputs_ids = list(map(lambda dict: {"text": torch.tensor([tokenizer.tokenize(dict['text'])])}, data))
     data_loader = build_pretraining_data_loader(inputs_ids, args.consumed_train_samples)
     data_iter = iter(data_loader)
     model = setup_model(model_provider_func=model_provider, model_type=ModelType.encoder_or_decoder)
-    result = model[0].generate_batch(data_iter)
+    result = model[0].generate_batch(data_iter, max_new_tokens=args.max_new_tokens)
     print(result)
 
 if __name__ == "__main__":
     main(args_defaults={'tokenizer_type': 'HFTokenizer'})
-    # main(args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
