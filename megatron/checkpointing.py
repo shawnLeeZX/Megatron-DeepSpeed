@@ -95,7 +95,7 @@ def get_checkpoint_name(checkpoints_path, iteration, release=False,
     if release:
         directory = 'release'
     else:
-        directory = 'iter_{:07d}'.format(iteration)
+        directory = 'iter_{}'.format(iteration)
 
     # Use both the tensor and pipeline MP rank.
     if pipeline_parallel is None:
@@ -230,7 +230,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     if not args.deepspeed:
         model = unwrap_model(model)
 
-    print_rank_0('saving checkpoint at iteration {:7d} to {}'.format(
+    print_rank_0('saving checkpoint at iteration {} to {}'.format(
         iteration, args.save))
 
     # Collect rng state across data parallel ranks.
@@ -309,7 +309,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    print_rank_0('  successfully saved checkpoint at iteration {:7d} to {}' \
+    print_rank_0('  successfully saved checkpoint at iteration {} to {}' \
                  .format(iteration, args.save))
 
     # And update the latest iteration
@@ -513,6 +513,7 @@ def load_args_from_checkpoint(args, load_arg='load'):
     _set_arg('use_rotary_position_embeddings', force=True)
     _set_arg('rotary_percent', force=True)
     _set_arg('add_bias_linear', force=True)
+    _set_arg('normalization', force=True)
     _set_arg('swiglu', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('apply_layernorm_1p', force=True)
