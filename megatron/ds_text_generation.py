@@ -119,13 +119,14 @@ def tensor_parallel_sample(logits, top_p=0.0, top_k=0, temperature=1.0):
 
     return new_token
 
-def model_provider(pre_process=True, post_process=True):
+def model_provider():
     """Build the model."""
 
     print_rank_0('building GPT model ...')
     see_memory_usage(f"Before Building Model", force=True)
 
     args = get_args()
+    tokenizer = get_tokenizer()
     config = core_transformer_config_from_args(args)
     with deepspeed.zero.Init(sequence_data_parallel_group=mpu.get_sequence_data_parallel_group(),
                              remote_device=None if args.remote_device == 'none' else args.remote_device,
@@ -149,6 +150,8 @@ def model_provider(pre_process=True, post_process=True):
                 parallel_output=True,
                 sample_fn=sample_fn,
                 inference_params_cls=inference_params_cls,
+                eos_id=tokenizer.eos,
+                pad_id=tokenizer.pad
             )
 
             # This is a hack to give us a reference to get_batch_pipe from within training.py
@@ -327,7 +330,7 @@ def main(args_defaults = None):
     initialize_megatron(extra_args_provider=add_text_generate_args,args_defaults=args_defaults)
     args = get_args()
     tokenizer = get_tokenizer()
-    data = [{"text":"This can be achieved by directly using the LlamaTokenizer class, or passing in "},
+    data = [{"text":"This can be achieved by directly using the LlamaTokenizer class, or passing in a b c"},
             {"text":"Of cause, I'm not a fan of the new movie. It's too bad that"},
             {"text":"As any dog owner knows, our furry little friends can sometimes be a lot to handle. But there's absolutely nothing that excuses what one owner from Chengdu, China, did to their six-week-old pup.\nIt all started when the adorable puppy, who is now known as Tuffy, accidentally mistook his former owner's phone for a chew toy—as a young pup often does. But instead of being understanding, the angry owner doused Tuffy with boiling hot water and threw him off a"}
             ]
@@ -336,7 +339,8 @@ def main(args_defaults = None):
     data_iter = iter(data_loader)
     model = setup_model(model_provider_func=model_provider, model_type=ModelType.encoder_or_decoder)
     result = model[0].generate_batch(data_iter, max_new_tokens=args.max_new_tokens)
-    print(result)
+    if dist.get_rank() == 0:
+        print(result)
 
 if __name__ == "__main__":
     main(args_defaults={'tokenizer_type': 'HFTokenizer'})
