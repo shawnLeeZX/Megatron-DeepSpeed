@@ -11,6 +11,9 @@ from functools import partial
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 import torch
+from torch.nn.utils.rnn import pad_sequence
+from torch.types import Number
+from typing import Dict, List, Any
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
 from megatron import (
@@ -20,7 +23,7 @@ from megatron import (
     print_rank_0, 
     is_rank_0
 )
-from megatron.utils import get_ltor_masks_and_position_ids
+from megatron.utils import _expand_mask, _make_causal_mask, LeftPaddingCollator
 from megatron.core import mpu, tensor_parallel
 from megatron.model import Float16Module, GPTModel, GPTModelPipe
 from megatron.core.enums import ModelType
@@ -82,22 +85,6 @@ class InferenceParams:
     def set_attn_mask(self, attn_mask):
         """Set the attention mask."""
         self.attn_mask = attn_mask
-def add_text_generate_args(parser):
-    """Text generation arguments."""
-    group = parser.add_argument_group(title='text generation')
-
-    group.add_argument("--temperature", type=float, default=1.0,
-                       help='Sampling temperature.')
-    group.add_argument("--top_p", type=float, default=0.0,
-                       help='Top p sampling.')
-    group.add_argument("--top_k", type=int, default=0,
-                       help='Top k sampling.')
-    group.add_argument("--out-seq-length", type=int, default=1024,
-                       help='Size of the output generated text.')
-    group.add_argument("--max-new-tokens", type=int,
-                       help='Maximum number of new tokens to generate.')
-
-    return parser
 
 def tensor_parallel_sample(logits, top_p=0.0, top_k=0, temperature=1.0):
 
@@ -119,7 +106,7 @@ def tensor_parallel_sample(logits, top_p=0.0, top_k=0, temperature=1.0):
 
     return new_token
 
-def model_provider():
+def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
     print_rank_0('building GPT model ...')
@@ -205,48 +192,31 @@ def get_batch_pipe(data):
     args = get_args()
     tokenizer = get_tokenizer()
 
-    if data['text'].dim() == 3:
-        data['text'] = data['text'].squeeze(1)
     # Items and their type.
-    keys = ['text']
+    keys = ['input_ids']
     datatype = torch.int64
-
-    # Broadcast data.
     data_b = tensor_parallel.broadcast_data(keys, data, datatype)
+    tokens = data_b['input_ids'].long()
 
-    # Unpack.
-    tokens_ = data_b['text'].long()
-    labels = tokens_[:, 1:].contiguous()
-    tokens = tokens_[:, :-1].contiguous()
+    keys = ['attention_mask']
+    datatype = torch.bool
+    data_b = tensor_parallel.broadcast_data(keys, data, datatype)
+    attention_mask = data_b['attention_mask'].bool()
+    combined_attention_mask = _make_causal_mask(tokens.shape, max_length=args.seq_length) \
+        .to(get_accelerator().current_device_name())
+    # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+    expanded_attn_mask = _expand_mask(attention_mask, max_length=args.seq_length).bool()
+    combined_attention_mask = expanded_attn_mask + combined_attention_mask
 
-    # Get the masks and postition ids.
-    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
-        tokens,
-        tokenizer.eod,
-        args.reset_position_ids,
-        args.reset_attention_mask,
-        args.eod_mask_loss,
-        out_seq_length=args.seq_length)
-    if args.curriculum_learning_legacy and args.curriculum_seqlen < tokens.size()[1]:
-        # seqlen-based curriculum learning
-        # tokens, position_ids, labels, loss_mask have size [batch size, seqlen]
-        tokens = tokens[:, :args.curriculum_seqlen].contiguous()
-        position_ids = position_ids[:, :args.curriculum_seqlen].contiguous()
-        if labels is not None:
-            labels = labels[:, :args.curriculum_seqlen].contiguous()
-        loss_mask = loss_mask[:, :args.curriculum_seqlen].contiguous()
+    position_ids = torch.arange(tokens.shape[1], dtype=torch.long, device=get_accelerator().current_device_name())
+    # suit for megatron pipe module format.
+    return (tokens, position_ids, combined_attention_mask), ()
 
-    return (tokens, position_ids, attention_mask), (labels, loss_mask)
-
-def setup_model(model_provider_func,model_type):
+def setup_model(model_provider_func, model_type):
     """Setup model and optimizer."""
     args = get_args()
 
     model = get_model(model_provider_func, model_type)
-
-    # initialize the compression here
-    unwrapped_model = unwrap_model(model,
-                                   (torchDDP, LocalDDP, Float16Module))
 
     if args.deepspeed:
         args.deepspeed_config_dict = _create_ds_config_dict()
@@ -289,13 +259,13 @@ def setup_model(model_provider_func,model_type):
 
     return model
 
-def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True):
+def get_model(model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True):
     """Build the model."""
     args = get_args()
     args.model_type = model_type
 
     # Build model.
-    model = model_provider_func()
+    model = model_provider()
     model.model_type = model_type
 
     if not isinstance(model, list):
@@ -327,15 +297,17 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     return model
 
 def main(args_defaults = None):
-    initialize_megatron(extra_args_provider=add_text_generate_args,args_defaults=args_defaults)
+    initialize_megatron(args_defaults=args_defaults)
     args = get_args()
     tokenizer = get_tokenizer()
-    data = [{"text":"This can be achieved by directly using the LlamaTokenizer class, or passing in a b c"},
+    data = [{"text":"This can be achiefved by directly using the LlamaTokenizer class, or passing in"},
             {"text":"Of cause, I'm not a fan of the new movie. It's too bad that"},
-            {"text":"As any dog owner knows, our furry little friends can sometimes be a lot to handle. But there's absolutely nothing that excuses what one owner from Chengdu, China, did to their six-week-old pup.\nIt all started when the adorable puppy, who is now known as Tuffy, accidentally mistook his former owner's phone for a chew toy—as a young pup often does. But instead of being understanding, the angry owner doused Tuffy with boiling hot water and threw him off a"}
+            {"text":"As any dog owner knows, our furry little friends can sometimes be a lot to handle. But there's absolutely nothing that excuses what one owner from Chengdu, China, did to their six-week-old pup.\nIt all started when the adorable puppy, who is now known as Tuffy, accidentally mistook his former owner's phone for a chew toy—as a young pup often does. But instead of being understanding, the angry owner doused Tuffy with boiling hot water and threw him off a"},
+            {"text":"the angry owner doused Tuffy with boiling hot water and threw him off a"}
             ]
-    inputs_ids = list(map(lambda dict: {"text": torch.tensor([tokenizer.tokenize(dict['text'])])}, data))
-    data_loader = build_pretraining_data_loader(inputs_ids, args.consumed_train_samples)
+    inputs_ids = list(map(lambda dict: {"input_ids": torch.tensor(tokenizer.tokenize(dict['text']))}, data))    
+    collator = LeftPaddingCollator(tokenizer.pad)
+    data_loader = build_pretraining_data_loader(inputs_ids, args.consumed_train_samples, collate_fn=collator)
     data_iter = iter(data_loader)
     model = setup_model(model_provider_func=model_provider, model_type=ModelType.encoder_or_decoder)
     result = model[0].generate_batch(data_iter, max_new_tokens=args.max_new_tokens)

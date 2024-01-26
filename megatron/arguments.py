@@ -44,6 +44,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
+    parser = _add_text_generate_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -570,6 +571,20 @@ def _add_retro_args(parser):
 
     return parser
 
+def _add_text_generate_args(parser):
+    """Text generation arguments."""
+    group = parser.add_argument_group(title='text generation')
+
+    group.add_argument("--temperature", type=float, default=1.0,
+                       help='Sampling temperature.')
+    group.add_argument("--top_p", type=float, default=0.0,
+                       help='Top p sampling.')
+    group.add_argument("--top_k", type=int, default=0,
+                       help='Top k sampling.')
+    group.add_argument("--max-new-tokens", type=int, default=None,
+                       help='Maximum number of new tokens to generate.')
+
+    return parser
 
 def _add_network_size_args(parser):
     group = parser.add_argument_group(title='network size')

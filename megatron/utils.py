@@ -7,6 +7,9 @@ import os
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as torchDDP
+from torch.nn.utils.rnn import pad_sequence
+from torch.types import Number
+from typing import Dict, List, Any
 
 from deepspeed.accelerator import get_accelerator
 if get_accelerator().device_name() == 'cuda':
@@ -54,6 +57,30 @@ def unwrap_model(model, module_instances=(torchDDP)):
         return unwrapped_model[0]
     return unwrapped_model
 
+def right_padding(sequences: list[torch.Tensor], padding_value: Number) -> torch.Tensor:
+    return pad_sequence(sequences, batch_first=True, padding_value=padding_value)
+
+def left_padding(sequences: list[torch.Tensor], padding_value: Number) -> torch.Tensor:
+    return right_padding(
+        [seq.flip(0) for seq in sequences],
+        padding_value=padding_value,
+    ).flip(1)
+
+class LeftPaddingCollator:
+    def __init__(self, pad_token_id: int):
+        self.pad_token_id = pad_token_id
+    def __call__(self, samples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        input_ids = [sample['input_ids'] for sample in samples]
+        attention_mask = [
+            input_id.new_ones(input_id.size(), dtype=torch.bool) for input_id in input_ids
+        ]
+
+        input_ids = left_padding(input_ids, padding_value=self.pad_token_id)
+        attention_mask = left_padding(attention_mask, padding_value=0)
+        return {
+            'input_ids': input_ids,  # size = (B, L)
+            'attention_mask': attention_mask,  # size = (B, L)
+        }
 
 def calc_params_l2_norm(model):
     """Calculate l2 norm of parameters """
@@ -223,6 +250,26 @@ def get_ltor_masks_and_position_ids(data,
         attention_mask = attention_mask.to(data.device)
 
     return attention_mask, loss_mask, position_ids
+
+def _make_causal_mask(input_ids_shape, max_length):
+    bsz, _ = input_ids_shape
+    mask = torch.full((max_length, max_length), True)
+    mask_cond = torch.arange(mask.size(-1))
+    mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), False)
+
+    return mask[None, None, :, :].expand(bsz, 1, max_length, max_length)
+
+
+def _expand_mask(mask, max_length=None):
+    bsz, src_len = mask.size()
+    device = mask.device
+    max_length = max_length if max_length is not None else src_len
+
+    mask = torch.concat((mask, torch.ones(bsz, max_length - src_len).bool().to(device)), 1)
+    expanded_mask = mask[:, None, None, :].expand(bsz, 1, max_length, max_length).bool()
+    inverted_mask = ~expanded_mask
+
+    return inverted_mask
 
 
 def print_rank_0(message):
