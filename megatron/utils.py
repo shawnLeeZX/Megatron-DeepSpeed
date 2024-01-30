@@ -42,6 +42,31 @@ def update_rotary_pos_emb(seq_length):
         get_accelerator().current_device_name())
     args.rotary_pos_emb = rotary_pos_emb
 
+def set_backend_seq_length(seq_length):
+    args = get_args()
+    # Predompute the attention mask and store it in args. This avoids having to
+    # pipeline it as an activation during training. The mask is constant, and thus
+    # we can reuse it.
+    print(seq_length)
+    if isinstance(seq_length, torch.Tensor):
+        seq_length = int(seq_length)
+    attention_mask = torch.tril(torch.ones(
+        (1, seq_length, seq_length), device=get_accelerator().current_device_name())).view(
+            1, 1, seq_length, seq_length)
+
+    # Convert attention mask to binary:
+    attention_mask = (attention_mask < 0.5)
+    if args.fp16:
+        attention_mask = attention_mask.half()
+    elif args.bf16:
+        attention_mask = attention_mask.bfloat16()
+
+    # Convert to bool:
+    args.attn_mask = attention_mask.to(torch.bool)
+
+    # For prertaining, since sequence length is fixed, cache rotary embedding in args, to avoid communicating around
+    if args.use_rotary_position_embeddings:
+        update_rotary_pos_emb(seq_length)
 
 def unwrap_model(model, module_instances=(torchDDP)):
     return_list = True

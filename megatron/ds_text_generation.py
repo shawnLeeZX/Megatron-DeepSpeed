@@ -30,7 +30,7 @@ from megatron.core.enums import ModelType
 from megatron.initialize import initialize_megatron
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.data.data_samplers import build_pretraining_data_loader
-from megatron.utils import unwrap_model, update_rotary_pos_emb
+from megatron.utils import unwrap_model, update_rotary_pos_emb, set_backend_seq_length
 from megatron.arguments import core_transformer_config_from_args
 from megatron.text_generation.sampling import sample
 from megatron.checkpointing import load_checkpoint
@@ -145,26 +145,7 @@ def model_provider(pre_process=True, post_process=True):
             # We need to call model.set_batch_fn after deepspeed.initialize
             model._megatron_batch_fn = get_batch_pipe
 
-            # Predompute the attention mask and store it in args. This avoids having to
-            # pipeline it as an activation during training. The mask is constant, and thus
-            # we can reuse it.
-            attention_mask = torch.tril(torch.ones(
-                (1, args.seq_length, args.seq_length), device=get_accelerator().current_device_name())).view(
-                    1, 1, args.seq_length, args.seq_length)
-
-            # Convert attention mask to binary:
-            attention_mask = (attention_mask < 0.5)
-            if args.fp16:
-                attention_mask = attention_mask.half()
-            elif args.bf16:
-                attention_mask = attention_mask.bfloat16()
-
-            # Convert to bool:
-            args.attn_mask = attention_mask.to(torch.bool)
-
-            # For prertaining, since sequence length is fixed, cache rotary embedding in args, to avoid communicating around
-            if args.use_rotary_position_embeddings:
-                update_rotary_pos_emb(args.seq_length)
+            set_backend_seq_length(args.seq_length)
         else:
             assert False, "Only DeepSpeed model is supported"
 
@@ -202,6 +183,8 @@ def get_batch_pipe(data):
     datatype = torch.bool
     data_b = tensor_parallel.broadcast_data(keys, data, datatype)
     attention_mask = data_b['attention_mask'].bool()
+    
+    max_length = min(tokens.shape[-1] + args.max_new_tokens, args.seq_length)
     combined_attention_mask = _make_causal_mask(tokens.shape, max_length=args.seq_length) \
         .to(get_accelerator().current_device_name())
     # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
