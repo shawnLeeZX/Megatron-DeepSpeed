@@ -232,6 +232,8 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                  num_tokentypes=0,
                  parallel_output=True,
                  sample_fn=None,
+                 eos_id=None,
+                 pad_id=None,
                  inference_params_cls=None):
         args = get_args()
         self.parallel_output = parallel_output
@@ -341,7 +343,9 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                          activation_checkpoint_interval=interval,
                          partition_method='type:transformer',
                          sample_fn=sample_fn,
-                         create_inference_params_fn=inference_params_cls,)
+                         create_inference_params_fn=inference_params_cls,
+                         eos_id=eos_id,
+                         pad_id=pad_id)
         
 
     @staticmethod

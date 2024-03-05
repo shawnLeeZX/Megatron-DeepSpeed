@@ -12,7 +12,7 @@ from megatron.core import mpu
 from deepspeed.runtime.dataloader import RepeatingLoader
 
 
-def build_pretraining_data_loader(dataset, consumed_samples):
+def build_pretraining_data_loader(dataset, consumed_samples, collate_fn=None):
     """Buld dataloader given an input dataset."""
 
     if dataset is None:
@@ -44,6 +44,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     loader = torch.utils.data.DataLoader(dataset,
                                        batch_sampler=batch_sampler,
                                        num_workers=args.num_workers,
+                                       collate_fn=collate_fn,
                                        pin_memory=True)
     if args.repeated_dataloader:
         loader=RepeatingLoader(loader)

@@ -7,6 +7,9 @@ import os
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as torchDDP
+from torch.nn.utils.rnn import pad_sequence
+from torch.types import Number
+from typing import Dict, List, Any
 
 from deepspeed.accelerator import get_accelerator
 if get_accelerator().device_name() == 'cuda':
@@ -39,6 +42,31 @@ def update_rotary_pos_emb(seq_length):
         get_accelerator().current_device_name())
     args.rotary_pos_emb = rotary_pos_emb
 
+def set_backend_seq_length(seq_length):
+    args = get_args()
+    # Predompute the attention mask and store it in args. This avoids having to
+    # pipeline it as an activation during training. The mask is constant, and thus
+    # we can reuse it.
+    print(seq_length)
+    if isinstance(seq_length, torch.Tensor):
+        seq_length = int(seq_length)
+    attention_mask = torch.tril(torch.ones(
+        (1, seq_length, seq_length), device=get_accelerator().current_device_name())).view(
+            1, 1, seq_length, seq_length)
+
+    # Convert attention mask to binary:
+    attention_mask = (attention_mask < 0.5)
+    if args.fp16:
+        attention_mask = attention_mask.half()
+    elif args.bf16:
+        attention_mask = attention_mask.bfloat16()
+
+    # Convert to bool:
+    args.attn_mask = attention_mask.to(torch.bool)
+
+    # For prertaining, since sequence length is fixed, cache rotary embedding in args, to avoid communicating around
+    if args.use_rotary_position_embeddings:
+        update_rotary_pos_emb(seq_length)
 
 def unwrap_model(model, module_instances=(torchDDP)):
     return_list = True
@@ -54,6 +82,30 @@ def unwrap_model(model, module_instances=(torchDDP)):
         return unwrapped_model[0]
     return unwrapped_model
 
+def right_padding(sequences: list[torch.Tensor], padding_value: Number) -> torch.Tensor:
+    return pad_sequence(sequences, batch_first=True, padding_value=padding_value)
+
+def left_padding(sequences: list[torch.Tensor], padding_value: Number) -> torch.Tensor:
+    return right_padding(
+        [seq.flip(0) for seq in sequences],
+        padding_value=padding_value,
+    ).flip(1)
+
+class LeftPaddingCollator:
+    def __init__(self, pad_token_id: int):
+        self.pad_token_id = pad_token_id
+    def __call__(self, samples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        input_ids = [sample['input_ids'] for sample in samples]
+        attention_mask = [
+            input_id.new_ones(input_id.size(), dtype=torch.bool) for input_id in input_ids
+        ]
+
+        input_ids = left_padding(input_ids, padding_value=self.pad_token_id)
+        attention_mask = left_padding(attention_mask, padding_value=0)
+        return {
+            'input_ids': input_ids,  # size = (B, L)
+            'attention_mask': attention_mask,  # size = (B, L)
+        }
 
 def calc_params_l2_norm(model):
     """Calculate l2 norm of parameters """
@@ -223,6 +275,26 @@ def get_ltor_masks_and_position_ids(data,
         attention_mask = attention_mask.to(data.device)
 
     return attention_mask, loss_mask, position_ids
+
+def _make_causal_mask(input_ids_shape, max_length):
+    bsz, _ = input_ids_shape
+    mask = torch.full((max_length, max_length), True)
+    mask_cond = torch.arange(mask.size(-1))
+    mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), False)
+
+    return mask[None, None, :, :].expand(bsz, 1, max_length, max_length)
+
+
+def _expand_mask(mask, max_length=None):
+    bsz, src_len = mask.size()
+    device = mask.device
+    max_length = max_length if max_length is not None else src_len
+
+    mask = torch.concat((mask, torch.ones(bsz, max_length - src_len).bool().to(device)), 1)
+    expanded_mask = mask[:, None, None, :].expand(bsz, 1, max_length, max_length).bool()
+    inverted_mask = ~expanded_mask
+
+    return inverted_mask
 
 
 def print_rank_0(message):
