@@ -130,7 +130,7 @@ def model_provider(pre_process=True, post_process=True):
                                 temperature=args.temperature, 
                                 top_k=args.top_k, 
                                 top_p=args.top_p)
-            
+
             model = GPTModelPipe(
                 config=config,
                 num_tokentypes=0,
@@ -285,7 +285,7 @@ def main(args_defaults = None):
     tokenizer = get_tokenizer()
     data = [{"text":"This can be achiefved by directly using the LlamaTokenizer class, or passing in"},
             {"text":"Of cause, I'm not a fan of the new movie. It's too bad that"},
-            {"text":"As any dog owner knows, our furry little friends can sometimes be a lot to handle. But there's absolutely nothing that excuses what one owner from Chengdu, China, did to their six-week-old pup.\nIt all started when the adorable puppy, who is now known as Tuffy, accidentally mistook his former owner's phone for a chew toy—as a young pup often does. But instead of being understanding, the angry owner doused Tuffy with boiling hot water and threw him off a"},
+            {"text":"Of cause, I'm not a fan of the new movie. It's too bad that"},
             {"text":"the angry owner doused Tuffy with boiling hot water and threw him off a"}
             ]
     inputs_ids = list(map(lambda dict: {"input_ids": torch.tensor(tokenizer.tokenize(dict['text']))}, data))    

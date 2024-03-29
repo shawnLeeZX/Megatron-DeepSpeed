@@ -10,6 +10,7 @@ from torch.nn.parallel import DistributedDataParallel as torchDDP
 from torch.nn.utils.rnn import pad_sequence
 from torch.types import Number
 from typing import Dict, List, Any
+from functools import partial
 
 from deepspeed.accelerator import get_accelerator
 if get_accelerator().device_name() == 'cuda':
@@ -21,11 +22,11 @@ from megatron import (
     get_adlr_autoresume,
     get_num_microbatches
 )
-from megatron.core import mpu
+from megatron.core import mpu, tensor_parallel
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.model.module import param_is_not_shared
 from megatron.model.rotary_pos_embedding import RotaryEmbedding
-
+from megatron import get_tokenizer
 
 def update_rotary_pos_emb(seq_length):
     args = get_args()
@@ -47,7 +48,6 @@ def set_backend_seq_length(seq_length):
     # Predompute the attention mask and store it in args. This avoids having to
     # pipeline it as an activation during training. The mask is constant, and thus
     # we can reuse it.
-    print(seq_length)
     if isinstance(seq_length, torch.Tensor):
         seq_length = int(seq_length)
     attention_mask = torch.tril(torch.ones(
@@ -455,3 +455,55 @@ def dump_weights(preamble, iteration, model, optimizer, tensor=None):
                 p = model[0].module.tied_modules.embed.word_embeddings.weight._hp_param
                 fh.write(f"{get_fingerprint(p)} module.tied_modules.embed.word_embeddings.weight._hp_param {p.shape}\n")
 
+def get_batch_pipe(data, mode = 'generate'):
+    """Modification of `get_batch` to work on `next(data_iterator)` instead of `data_iterator`"""
+    args = get_args()
+    tokenizer = get_tokenizer()
+
+    # Items and their type.
+    keys = ['input_ids']
+    datatype = torch.int64
+    data_b = tensor_parallel.broadcast_data(keys, data, datatype)
+    input_ids = data_b['input_ids'].long()
+
+    keys = ['attention_mask']
+    datatype = torch.bool
+    data_b = tensor_parallel.broadcast_data(keys, data, datatype)
+    attention_mask = data_b['attention_mask'].bool()
+
+    if mode == 'evaluation':
+        labels = input_ids[:, 1:].contiguous()
+        tokens = input_ids[:, :-1].contiguous()
+        attention_mask = attention_mask[:, :-1]
+    elif mode == 'finetune':
+        keys = ['labels']
+        datatype = torch.int64
+        data_b = tensor_parallel.broadcast_data(keys, data, datatype)
+        labels = data_b['labels'].long()[:, 1:].contiguous()
+        tokens = input_ids[:, :-1].contiguous()
+        attention_mask = attention_mask[:, :-1]
+    elif mode == 'generation':
+        tokens = input_ids
+        labels = tokens
+
+    max_length = min(tokens.shape[-1] + args.max_new_tokens, args.seq_length)
+    combined_attention_mask = _make_causal_mask(tokens.shape, max_length=args.seq_length) \
+        .to(get_accelerator().current_device_name())
+    # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+    expanded_attn_mask = _expand_mask(attention_mask, max_length=args.seq_length).bool()
+    combined_attention_mask = expanded_attn_mask + combined_attention_mask
+
+    position_ids = torch.arange(tokens.shape[1], dtype=torch.long, device=get_accelerator().current_device_name())
+    loss_mask = labels.ne(tokenizer.pad)
+    
+    # suit for megatron pipe module format.
+    return (tokens, position_ids, combined_attention_mask), (labels, loss_mask)
+
+def generation_batch_fn(data):
+    return get_batch_pipe(data, mode='generation')
+
+def evaluation_batch_fn(data):
+    return get_batch_pipe(data, mode='evaluation')
+
+def finetune_batch_fn(data):
+    return get_batch_pipe(data, mode='finetune')
