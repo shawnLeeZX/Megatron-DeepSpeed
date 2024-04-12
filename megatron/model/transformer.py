@@ -2020,3 +2020,44 @@ class LMHeadPipe(MegatronModule):
         else:
             assert False
             return logits, attention_mask
+
+class ScoreHeadPipe(MegatronModule):
+    """
+    Arguments:
+        vocab_size: size of vocabulary.
+        hidden_size: hidden size
+        gather_output: wether output logits being gathered or not.
+        init_method: init method for weight initialization
+        config:
+    """
+
+    def __init__(self, hidden_size, score_size, config):
+        args = get_args()
+        super(ScoreHeadPipe, self).__init__()
+        self.score_head = tensor_parallel.RowParallelLinear(
+            input_size=hidden_size,
+            output_size=score_size,
+            config=config,
+            bias=False,
+            init_method=config.init_method,
+        )
+
+    def forward(self, inputs, **kwargs):
+        assert torch.is_tensor(inputs) or isinstance(inputs, tuple)
+
+        if not hasattr(self, '_args'):
+            self._args = get_args()
+
+        if isinstance(inputs, tuple):
+            hidden_states = inputs[0]
+        else:
+            hidden_states = inputs
+
+        score, _ = self.score_head(hidden_states)
+
+        # If cmd args has attn_mask, we don't forward it as an activation.
+        if hasattr(self._args, 'attn_mask'):
+            return score
+        else:
+            assert False
+            return score, attention_mask

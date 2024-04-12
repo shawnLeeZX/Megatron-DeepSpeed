@@ -15,12 +15,11 @@ from .language_model import get_language_model
 from .utils import init_method_normal
 from .utils import scaled_init_method_normal
 
+from megatron.model import RMSNorm
 from megatron.model import LayerNorm
 from .language_model import EmbeddingPipe
-from .transformer import ParallelTransformerLayerPipe, LMHeadPipe
+from .transformer import ParallelTransformerLayerPipe, LMHeadPipe, ScoreHeadPipe
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
-
-from megatron.model import RMSNorm
 
 
 try:         
@@ -223,7 +222,6 @@ def CrossEntropy(output, labels):
     loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
     return loss
 
-
 class GPTModelPipe(PipelineModule,MegatronModule):
     """GPT-2 Language model."""
 
@@ -300,24 +298,28 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                 lm_output,
                 embedding.word_embeddings_weight,
                 self.parallel_output)
-        if args.untie_embeddings_and_output_weights:
-            self.specs.append(
-                LayerSpec(LMHeadPipe, args.hidden_size, args.padded_vocab_size, config)
-            )
-        else:
-            self.specs.append(
-                TiedLayerSpec('embed',
-                              EmbeddingPipe,
-                              args.hidden_size,
-                              args.padded_vocab_size,
-                              args.max_position_embeddings,
-                              args.hidden_dropout,
-                              config,
-                              num_tokentypes=num_tokentypes,
-                              embedding_weights_in_fp32=args.embedding_weights_in_fp32,
-                              forward_fn=_logits_helper,
-                              tied_weight_attr='word_embeddings_weight')
-            )
+        
+        if args.final_layer == 'logit':
+            if args.untie_embeddings_and_output_weights:
+                self.specs.append(
+                    LayerSpec(LMHeadPipe, args.hidden_size, args.padded_vocab_size, config)
+                )
+            else:
+                self.specs.append(
+                    TiedLayerSpec('embed',
+                                EmbeddingPipe,
+                                args.hidden_size,
+                                args.padded_vocab_size,
+                                args.max_position_embeddings,
+                                args.hidden_dropout,
+                                config,
+                                num_tokentypes=num_tokentypes,
+                                embedding_weights_in_fp32=args.embedding_weights_in_fp32,
+                                forward_fn=_logits_helper,
+                                tied_weight_attr='word_embeddings_weight')
+                )
+        elif args.final_layer == 'score':
+            self.specs.append(LayerSpec(ScoreHeadPipe, args.hidden_size, args.score_dim, config))
 
         # Convert to fp32 if needed
         if args.fp16 or args.bf16:

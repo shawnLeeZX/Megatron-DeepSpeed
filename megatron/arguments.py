@@ -599,6 +599,10 @@ def _add_network_size_args(parser):
                            help='number of experts list, MoE related.')
     group.add_argument('--mlp-type', type=str, default='standard',
                            help='Only applicable when num-experts > 1, accepts [standard, residual]')
+    group.add_argument('--final-layer', type=str, default='logit', choices=['logit', 'score'],
+                           help='Type of final layer, accepts [logit, score]')
+    group.add_argument('--score-dim', type=int, default=1,
+                           help='Score dimension, only applicable when final-layer=score')
     group.add_argument('--topk', type=int, default=1,
                            help='Sets the k in TopK gating for MoE layers')
     group.add_argument('--expert-interval', type=int, default=2,
@@ -1294,6 +1298,8 @@ def _add_data_args(parser):
                        help='Force to use certain index file.')
     group.add_argument('--train-shuffle-idx-path', type=str, default=None,
                        help='Force to use certain index file.')
+    group.add_argument('--repeated-dataloader', action='store_true',
+                       help='Once all the data has been loaded, reuse the DataLoader.')
     return parser
 
 
